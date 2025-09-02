@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+
+"""
+KVH IMU Connector for Keelson
+
+This connector reads KVH IMU binary data in Format B from stdin and publishes
+the data to Zenoh topics using the Keelson protocol.
+
+Binary Format B Structure (40 bytes total):
+- Bytes 1-4: Header (0xFE81FF56)
+- Bytes 5-36: Message data
+  - Bytes 5-16: X,Y,Z rotational data (SPFP rad/s)
+  - Bytes 17-28: X,Y,Z acceleration data (SPFP m/s²)  
+  - Bytes 29-32: Timestamp (UINT32 microseconds)
+  - Byte 33: Status byte (validity flags)
+  - Byte 34: Sequence number (UINT8)
+  - Bytes 35-36: Temperature (INT16)
+- Bytes 37-40: CRC checksum
+
+Usage:
+  socat /dev/ttyUSB0,b115200,raw,echo=0 - | ./main [options]
+"""
+
+import zenoh
+import logging
+import warnings
+import json
+import keelson
+from terminal_inputs import terminal_inputs
+from keelson.payloads.Primitives_pb2 import TimestampedString
+from keelson.payloads.Decomposed3DVector_pb2 import Decomposed3DVector
+from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
+import sys
+import time
+import socket
+from datetime import datetime
+import struct
+
+# Global variables
+session = None
+args = None
+sock = None
+latest_os_message = None
+last_received_time = None
+udp_server_address = None
+deg2rad = lambda x : x * 0.0174533
+g2ms = lambda x : x * 9.80665 
+
+
+def decode_kvh_binary_format_b(data):
+    """
+    Decode KVH IMU binary format B message (40 bytes total)
+    
+    Format B structure (big-endian from device):
+    - Header: 4 bytes (0xFE81FF56)
+    - Gyro X: 4 bytes (float, rad/s)
+    - Gyro Y: 4 bytes (float, rad/s)  
+    - Gyro Z: 4 bytes (float, rad/s)
+    - Accel X: 4 bytes (float, m/s²)
+    - Accel Y: 4 bytes (float, m/s²)
+    - Accel Z: 4 bytes (float, m/s²)
+    - Timestamp: 4 bytes (uint32, microseconds from 1PPS)
+    - Status: 1 byte (sensor validity flags)
+    - Sequence: 1 byte (0-127, wrapping counter)
+    - Temperature: 2 bytes (int16, degrees C)
+    - CRC: 4 bytes (uint32)
+    """
+    if len(data) != 40:
+        print(f"ERROR: Expected 40 bytes, got {len(data)}")
+        return None
+    
+    try:
+        # Unpack the entire binary data using big-endian format 
+        # Device sends data in big-endian (network byte order)
+        # Format: I f f f f f f I B B h I (12 items total)
+        unpacked = struct.unpack('>IffffffIBBhI', data)
+        
+        header = unpacked[0]
+        gyro_x = unpacked[1]
+        gyro_y = unpacked[2] 
+        gyro_z = unpacked[3]
+        accel_x = unpacked[4]
+        accel_y = unpacked[5]
+        accel_z = unpacked[6]
+        timestamp_us = unpacked[7]
+        status = unpacked[8]
+        sequence = unpacked[9]
+        temperature_raw = unpacked[10]
+        crc = unpacked[11]
+        
+        # Validate header
+        if header != 0xFE81FF56:
+            print(f"ERROR: Invalid header 0x{header:08X}, expected 0xFE81FF56")
+            return None
+            
+        # Decode status bits (0 = valid, 1 = invalid per OpenDLV code)
+        gyro_x_valid = (status & 0x01) == 0
+        gyro_y_valid = (status & 0x02) == 0
+        gyro_z_valid = (status & 0x04) == 0
+        accel_x_valid = (status & 0x10) == 0
+        accel_y_valid = (status & 0x20) == 0
+        accel_z_valid = (status & 0x40) == 0
+        
+        return {
+            'header': header,
+            'gyro_x': gyro_x,
+            'gyro_y': gyro_y,
+            'gyro_z': gyro_z,
+            'accel_x': accel_x,
+            'accel_y': accel_y,
+            'accel_z': accel_z,
+            'timestamp_us': timestamp_us,
+            'status': status,
+            'sequence': sequence,
+            'temperature_raw': temperature_raw,
+            'gyro_x_valid': gyro_x_valid,
+            'gyro_y_valid': gyro_y_valid,
+            'gyro_z_valid': gyro_z_valid,
+            'accel_x_valid': accel_x_valid,
+            'accel_y_valid': accel_y_valid,
+            'accel_z_valid': accel_z_valid,
+            'crc': crc
+        }
+        
+    except struct.error as e:
+        print(f"ERROR: Failed to unpack binary data: {e}")
+        return None
+
+
+def configure_kvh_device_for_binary_format_b():
+    """
+    Send configuration commands to KVH device to enable binary format B output.
+    Based on OpenDLV implementation.
+    
+    Commands to send:
+    - =CONFIG,1 - Enable configuration mode
+    - =OUTPUTFMT,B - Set output format to B
+    - =OUTPUTRATE,200 - Set output rate to 200Hz
+    - =OUTPUTBAUD,115200 - Set baud rate to 115200 
+    - =CONFIG,0 - Exit configuration mode
+    """
+    config_commands = [
+        "=CONFIG,1\r\n",
+        "=OUTPUTFMT,B\r\n", 
+        "=OUTPUTRATE,200\r\n",
+        "=OUTPUTBAUD,115200\r\n",
+        "=CONFIG,0\r\n"
+    ]
+    
+    for cmd in config_commands:
+        print(f"Sending configuration: {cmd.strip()}")
+        sys.stdout.write(cmd)
+        sys.stdout.flush()
+        time.sleep(0.1)  # Small delay between commands
+    
+    print("Configuration commands sent. Device should now output binary format B.")
+
+
+
+if __name__ == "__main__":
+    # Input arguments and configurations
+    args = terminal_inputs()
+    # Setup logger
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s [%(lineno)d]: %(message)s", level=args.log_level
+    )
+
+    logging.captureWarnings(True)
+    warnings.filterwarnings("once")
+    # initiate logging
+    zenoh.init_log_from_env_or("error")
+
+    # Construct session
+    logging.info("Opening Zenoh session...")
+    conf = zenoh.Config()
+
+    if args.mode is not None:
+        conf.insert_json5("mode", json.dumps(args.mode))
+    if args.connect is not None:
+        conf.insert_json5("connect/endpoints", json.dumps(args.connect))
+
+    with zenoh.open(conf) as session:
+
+        #################################################
+        # Setting up Publishers
+
+        if "raw" in args.publish:
+            keyexp_pub_raw = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="raw_json",
+                source_id=args.source_id,
+            )
+            pub_raw = session.declare_publisher(
+                keyexp_pub_raw, congestion_control=zenoh.CongestionControl.DROP, priority=zenoh.Priority.DEFAULT)
+            logging.info(f"Publishing to: {keyexp_pub_raw}")
+
+        if "imu" in args.publish:
+            # Acceleration
+            keyexp_pub_imu_acc = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="linear_acceleration_mpss",
+                source_id=args.source_id,
+            )
+            pub_imu_acc = session.declare_publisher(
+                keyexp_pub_imu_acc, congestion_control=zenoh.CongestionControl.DROP, priority=zenoh.Priority.DEFAULT)
+            logging.info(f"Publishing to: {keyexp_pub_imu_acc}")
+
+            # Velocity
+            keyexp_pub_imu_vel = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="angular_velocity_radps",
+                source_id=args.source_id,
+            )
+            pub_imu_vel = session.declare_publisher(
+                keyexp_pub_imu_vel, congestion_control=zenoh.CongestionControl.DROP, priority=zenoh.Priority.DEFAULT)
+            logging.info(f"Publishing to: {keyexp_pub_imu_vel}")
+
+        if "pos" in args.publish:
+            keyexp_pub_pos = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="location_fix",
+                source_id=args.source_id,
+            )
+            pub_pos = session.declare_publisher(
+                keyexp_pub_pos, congestion_control=zenoh.CongestionControl.DROP, priority=zenoh.Priority.DEFAULT)
+            logging.info(f"Publishing to: {keyexp_pub_pos}")
+
+        # Added frequency tracking for IMU
+        last_time_imu = time.time()
+        imu_count = 0
+
+        logging.info("Press CTRL-C to quit...")
+
+        try:
+            buffer = b''
+            message_count = 0
+            data_received_count = 0
+            
+            # Read binary data from stdin
+            while True:
+                # Read data in chunks
+                chunk = sys.stdin.buffer.read(1024)
+                if not chunk:
+                    break
+                
+                buffer += chunk
+                data_received_count += len(chunk)
+                
+                # Log first chunk for debugging
+                if data_received_count <= 1024:
+                    logging.info(f"First {len(chunk)} bytes received (showing first 100): {chunk[:100].hex() if len(chunk) > 0 else 'empty'}")
+                    logging.info(f"As ASCII (first 100 chars): {chunk[:100].decode('ascii', errors='replace')}")
+                
+                # Process complete messages (40 bytes each)
+                while len(buffer) >= 40:
+                    # Look for the header pattern
+                    header_pos = buffer.find(b'\xFE\x81\xFF\x56')
+                    
+                    if header_pos == -1:
+                        # No header found, log some debug info periodically
+                        if len(buffer) > 1000:  # Prevent buffer from growing too large
+                            logging.warning(f"No KVH header found in {len(buffer)} bytes of data. Sample: {buffer[:50].hex()}")
+                            logging.warning(f"Sample as ASCII: {buffer[:50].decode('ascii', errors='replace')}")
+                            # Keep last 39 bytes for potential partial header at end
+                            buffer = buffer[-39:] if len(buffer) > 39 else b''
+                        break
+                    
+                    # Remove any data before the header
+                    if header_pos > 0:
+                        logging.info(f"Skipped {header_pos} bytes before KVH header")
+                        buffer = buffer[header_pos:]
+                    
+                    # Check if we have a complete message
+                    if len(buffer) < 40:
+                        break
+                    
+                    # Extract the message
+                    message_data = buffer[:40]
+                    buffer = buffer[40:]
+                    message_count += 1
+                    
+                    # Log first few messages for debugging
+                    if message_count <= 3:
+                        logging.info(f"KVH message #{message_count}: {message_data.hex()}")
+                    
+                    # Decode the binary message
+                    decoded = decode_kvh_binary_format_b(message_data)
+                    
+                    if decoded is None:
+                        logging.warning("Failed to decode binary message")
+                        continue
+                    
+                    # Publish the raw binary data
+                    if "raw" in args.publish:
+                        payload_raw = TimestampedString()
+                        payload_raw.timestamp.FromNanoseconds(
+                            int(datetime.now().timestamp() * 1e9))
+                        # Convert binary to hex string for raw output
+                        payload_raw.value = message_data.hex()
+                        serialized_payload = payload_raw.SerializeToString()
+                        envelope = keelson.enclose(serialized_payload)
+                        pub_raw.put(envelope)
+
+                    # Process IMU data
+                    imu_count += 1
+                    if (time.time() - last_time_imu) >= 5:
+                        freq_imu = imu_count / 5.0
+                        logging.info(f"IMU frequency: {freq_imu} Hz (processed {message_count} total messages)")
+                        imu_count = 0
+                        last_time_imu = time.time()
+
+                    if "imu" in args.publish:
+                        logging.debug(f"IMU Binary Data Decoded: gyro=({decoded['gyro_x']:.3f}, {decoded['gyro_y']:.3f}, {decoded['gyro_z']:.3f}), "
+                                    f"accel=({decoded['accel_x']:.3f}, {decoded['accel_y']:.3f}, {decoded['accel_z']:.3f}), "
+                                    f"seq={decoded['sequence']}, temp={decoded['temperature_raw']}")
+
+                        # Only publish if data is valid
+                        if decoded['accel_x_valid'] and decoded['accel_y_valid'] and decoded['accel_z_valid']:
+                            # Acceleration 
+                            payload_imu_acc = Decomposed3DVector()
+                            payload_imu_acc.timestamp.FromNanoseconds(int(datetime.now().timestamp() * 1e9))
+                            
+                            if args.frame_id is not None:
+                                payload_imu_acc.frame_id = args.frame_id
+                                
+                            # Binary format already provides m/s² values
+                            payload_imu_acc.vector.x = decoded['accel_x']
+                            payload_imu_acc.vector.y = decoded['accel_y']
+                            payload_imu_acc.vector.z = decoded['accel_z']
+
+                            serialized_payload = payload_imu_acc.SerializeToString()
+                            envelope = keelson.enclose(serialized_payload)
+                            pub_imu_acc.put(envelope)
+
+                        if decoded['gyro_x_valid'] and decoded['gyro_y_valid'] and decoded['gyro_z_valid']:
+                            # Angular velocity
+                            payload_imu_vel = Decomposed3DVector()
+                            payload_imu_vel.timestamp.FromNanoseconds(int(datetime.now().timestamp() * 1e9))
+                            if args.frame_id is not None:
+                                payload_imu_vel.frame_id = args.frame_id
+                                
+                            # Binary format already provides rad/s values
+                            payload_imu_vel.vector.x = decoded['gyro_x']
+                            payload_imu_vel.vector.y = decoded['gyro_y']
+                            payload_imu_vel.vector.z = decoded['gyro_z']
+
+                            serialized_payload = payload_imu_vel.SerializeToString()
+                            envelope = keelson.enclose(serialized_payload)
+                            pub_imu_vel.put(envelope)
+
+                        logging.debug(f"IMU Binary Data SENT")
+                        
+                # Log progress periodically
+                if data_received_count % 10000 == 0:
+                    logging.info(f"Processed {data_received_count} bytes total, found {message_count} KVH messages")
+
+        except KeyboardInterrupt:
+            logging.info("Keyboard interrupt received, exiting...")
+        except Exception as e:
+            logging.error(f"An error occurred while processing binary data: {e}")
+                
+
+
+
