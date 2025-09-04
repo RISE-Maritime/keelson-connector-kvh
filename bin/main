@@ -3,22 +3,44 @@
 """
 KVH IMU Connector for Keelson
 
-This connector reads KVH IMU binary data in Format B from stdin and publishes
+This connector reads KVH IMU binary data in Format C from stdin and publishes
 the data to Zenoh topics using the Keelson protocol.
 
-Binary Format B Structure (40 bytes total):
-- Bytes 1-4: Header (0xFE81FF56)
+Based on the OpenDLV C++ reference implementation:
+https://git.opendlv.org/testing/opendlv-device-imu-kvhp1775
+
+Binary Format C Structure (38 bytes total):
+- Bytes 1-4: Header (0xFE81FF57)
 - Bytes 5-36: Message data
   - Bytes 5-16: X,Y,Z rotational data (SPFP rad/s)
-  - Bytes 17-28: X,Y,Z acceleration data (SPFP m/s²)  
-  - Bytes 29-32: Timestamp (UINT32 microseconds)
-  - Byte 33: Status byte (validity flags)
-  - Byte 34: Sequence number (UINT8)
-  - Bytes 35-36: Temperature (INT16)
-- Bytes 37-40: CRC checksum
+  - Bytes 17-28: X,Y,Z acceleration data (SPFP in g's, converted to m/s²)  
+  - Bytes 29-32: Interleaved Temperature/Magnetic data (SPFP)
+  - Byte 33: Status byte (validity flags - 0=valid, 1=invalid)
+  - Byte 34: Sequence number (UINT8, 0-127 wrapping)
+- Bytes 35-38: CRC-32/MPEG-2 checksum (split as 2x UINT16)
+
+Interleaved Temperature/Magnetic Data (based on sequence % 4):
+- sequence % 4 == 0: Temperature (°C)
+- sequence % 4 == 1: Magnetic field X (Gauss)
+- sequence % 4 == 2: Magnetic field Y (Gauss)  
+- sequence % 4 == 3: Magnetic field Z (Gauss)
+
+Key features following C++ implementation:
+- Format C is the default (as per C++ implementation)
+- CRC-32/MPEG-2 validation  
+- Sequence number validation (0-127 wrapping)
+- Temperature range validation (-40°C to +75°C)
+- Magnetic field range validation (-10G to +10G)
+- Acceleration conversion from g's to m/s² using standard gravity (9.80665)
+- Proper big-endian data handling
+- Interleaved temperature and magnetic field data
+
+Configuration commands sent to device:
+- Format C output, 1000Hz rate, 921600 baud
+- Linear acceleration in g's, angular velocity in rad/s
 
 Usage:
-  socat /dev/ttyUSB0,b115200,raw,echo=0 - | ./main [options]
+  socat /dev/ttyUSB0,b921600,raw,echo=0 - | ./main [options]
 """
 
 import zenoh
@@ -43,55 +65,103 @@ sock = None
 latest_os_message = None
 last_received_time = None
 udp_server_address = None
+expected_sequence = 0  # Track expected sequence number
+first_packet = True    # Track if this is the first packet received
+# Variables for change detection (Format C)
+last_gyro_data = None
+last_accel_data = None
+last_temp_mag_data = None
+last_sequence_mod4 = None
 deg2rad = lambda x : x * 0.0174533
 g2ms = lambda x : x * 9.80665 
+STANDARD_GRAVITY = 9.80665  # Standard gravity constant from C++ implementation 
 
 
-def decode_kvh_binary_format_b(data):
+def decode_kvh_binary_format_c(data):
     """
-    Decode KVH IMU binary format B message (40 bytes total)
+    Decode KVH IMU binary format C message (38 bytes total)
+    Based on OpenDLV C++ implementation with proper endian handling and CRC validation.
     
-    Format B structure (big-endian from device):
-    - Header: 4 bytes (0xFE81FF56)
+    Format C structure (big-endian from device):
+    - Header: 4 bytes (0xFE81FF57)
     - Gyro X: 4 bytes (float, rad/s)
     - Gyro Y: 4 bytes (float, rad/s)  
     - Gyro Z: 4 bytes (float, rad/s)
-    - Accel X: 4 bytes (float, m/s²)
-    - Accel Y: 4 bytes (float, m/s²)
-    - Accel Z: 4 bytes (float, m/s²)
-    - Timestamp: 4 bytes (uint32, microseconds from 1PPS)
+    - Accel X: 4 bytes (float, g's - needs conversion to m/s²)
+    - Accel Y: 4 bytes (float, g's - needs conversion to m/s²)
+    - Accel Z: 4 bytes (float, g's - needs conversion to m/s²)
+    - Temp/Magnetic Data: 4 bytes (float, interleaved based on sequence % 4)
     - Status: 1 byte (sensor validity flags)
     - Sequence: 1 byte (0-127, wrapping counter)
-    - Temperature: 2 bytes (int16, degrees C)
-    - CRC: 4 bytes (uint32)
+    - CRC: 4 bytes split as 2x uint16 (ui16CRCHigh, ui16CRCLow)
+    
+    The temp/magnetic data alternates:
+    - seq % 4 == 0: Temperature (°C)
+    - seq % 4 == 1: Magnetic field X (Gauss)  
+    - seq % 4 == 2: Magnetic field Y (Gauss)
+    - seq % 4 == 3: Magnetic field Z (Gauss)
     """
-    if len(data) != 40:
-        print(f"ERROR: Expected 40 bytes, got {len(data)}")
+    if len(data) != 38:
+        print(f"ERROR: Expected 38 bytes for Format C, got {len(data)}")
         return None
     
     try:
         # Unpack the entire binary data using big-endian format 
-        # Device sends data in big-endian (network byte order)
-        # Format: I f f f f f f I B B h I (12 items total)
-        unpacked = struct.unpack('>IffffffIBBhI', data)
+        # Format C: I + 7*f + B + B + H + H = 4 + 28 + 1 + 1 + 2 + 2 = 38 bytes total (12 items)
+        unpacked = struct.unpack('>I7fBBHH', data)
         
         header = unpacked[0]
         gyro_x = unpacked[1]
         gyro_y = unpacked[2] 
         gyro_z = unpacked[3]
-        accel_x = unpacked[4]
-        accel_y = unpacked[5]
-        accel_z = unpacked[6]
-        timestamp_us = unpacked[7]
+        accel_x = unpacked[4]  # In g's, needs conversion
+        accel_y = unpacked[5]  # In g's, needs conversion
+        accel_z = unpacked[6]  # In g's, needs conversion
+        temp_magnetic_data = unpacked[7]  # Interleaved temp/magnetic data
         status = unpacked[8]
         sequence = unpacked[9]
-        temperature_raw = unpacked[10]
-        crc = unpacked[11]
+        crc_high = unpacked[10]
+        crc_low = unpacked[11]
         
-        # Validate header
-        if header != 0xFE81FF56:
-            print(f"ERROR: Invalid header 0x{header:08X}, expected 0xFE81FF56")
+        # Validate header - Format C uses 0xFE81FF57
+        if header != 0xFE81FF57:
+            print(f"ERROR: Invalid header 0x{header:08X}, expected 0xFE81FF57 for Format C")
             return None
+        
+        # Reconstruct CRC from high and low parts (as per C++ implementation)
+        crc_received = (crc_high << 16) | crc_low
+        
+        # Calculate CRC on data excluding the header (34 bytes: from gyro data to sequence)
+        # This matches the C++ implementation: (FORMAT_C_BYTES - DATA_HEADER_BYTES)
+        crc_calculated = calculate_crc32(data[4:36])  # Skip header and CRC
+        if crc_received != crc_calculated:
+            print(f"WARNING: CRC mismatch. Received: 0x{crc_received:08X}, Calculated: 0x{crc_calculated:08X}")
+        
+        # Determine what the temp_magnetic_data represents based on sequence
+        sequence_mod4 = sequence % 4
+        temp_data = None
+        mag_x_data = None
+        mag_y_data = None  
+        mag_z_data = None
+        temp_valid = False
+        mag_valid = False
+        
+        if sequence_mod4 == 0:
+            # Temperature data
+            temp_data = temp_magnetic_data
+            temp_valid = validate_temperature(temp_data)
+        elif sequence_mod4 == 1:
+            # Magnetic field X
+            mag_x_data = temp_magnetic_data
+            mag_valid = validate_magnetic_field(mag_x_data)
+        elif sequence_mod4 == 2:
+            # Magnetic field Y
+            mag_y_data = temp_magnetic_data
+            mag_valid = validate_magnetic_field(mag_y_data)
+        elif sequence_mod4 == 3:
+            # Magnetic field Z  
+            mag_z_data = temp_magnetic_data
+            mag_valid = validate_magnetic_field(mag_z_data)
             
         # Decode status bits (0 = valid, 1 = invalid per OpenDLV code)
         gyro_x_valid = (status & 0x01) == 0
@@ -101,50 +171,94 @@ def decode_kvh_binary_format_b(data):
         accel_y_valid = (status & 0x20) == 0
         accel_z_valid = (status & 0x40) == 0
         
+        # Convert acceleration from g's to m/s² (standard gravity = 9.80665)
+        standard_g = 9.80665
+        accel_x_ms2 = accel_x * standard_g if accel_x_valid else 0.0
+        accel_y_ms2 = accel_y * standard_g if accel_y_valid else 0.0
+        accel_z_ms2 = accel_z * standard_g if accel_z_valid else 0.0
+        
         return {
             'header': header,
             'gyro_x': gyro_x,
             'gyro_y': gyro_y,
             'gyro_z': gyro_z,
-            'accel_x': accel_x,
-            'accel_y': accel_y,
-            'accel_z': accel_z,
-            'timestamp_us': timestamp_us,
+            'accel_x': accel_x,  # Raw value in g's
+            'accel_y': accel_y,  # Raw value in g's
+            'accel_z': accel_z,  # Raw value in g's
+            'accel_x_ms2': accel_x_ms2,  # Converted to m/s²
+            'accel_y_ms2': accel_y_ms2,  # Converted to m/s²
+            'accel_z_ms2': accel_z_ms2,  # Converted to m/s²
+            'temp_magnetic_data': temp_magnetic_data,
+            'sequence_mod4': sequence_mod4,
+            'temp_data': temp_data,
+            'mag_x_data': mag_x_data,
+            'mag_y_data': mag_y_data,
+            'mag_z_data': mag_z_data,
             'status': status,
             'sequence': sequence,
-            'temperature_raw': temperature_raw,
             'gyro_x_valid': gyro_x_valid,
             'gyro_y_valid': gyro_y_valid,
             'gyro_z_valid': gyro_z_valid,
             'accel_x_valid': accel_x_valid,
             'accel_y_valid': accel_y_valid,
             'accel_z_valid': accel_z_valid,
-            'crc': crc
+            'temperature_valid': temp_valid,
+            'magnetic_valid': mag_valid,
+            'crc_received': crc_received,
+            'crc_calculated': crc_calculated,
+            'crc_valid': crc_received == crc_calculated
         }
         
     except struct.error as e:
-        print(f"ERROR: Failed to unpack binary data: {e}")
+        print(f"ERROR: Failed to unpack Format C binary data: {e}")
         return None
 
 
-def configure_kvh_device_for_binary_format_b():
+def calculate_crc32(data):
     """
-    Send configuration commands to KVH device to enable binary format B output.
-    Based on OpenDLV implementation.
+    Calculate CRC-32/MPEG-2 checksum as used in C++ implementation.
+    This implements the same algorithm as the C++ uiCalcCRC function.
+    """
+    # CRC-32/MPEG-2 polynomial: 0x04C11DB7
+    # This is the same as used in the C++ implementation
+    crc = 0xFFFFFFFF
+    
+    for byte in data:
+        crc = crc ^ (byte << 24)
+        for _ in range(8):
+            if crc & 0x80000000:
+                crc = (crc << 1) ^ 0x04C11DB7
+            else:
+                crc = crc << 1
+            crc = crc & 0xFFFFFFFF
+    
+    return crc
+
+
+def configure_kvh_device_for_binary_format_c():
+    """
+    Send configuration commands to KVH device to enable binary format C output.
+    Based on OpenDLV C++ implementation - Format C is the default.
     
     Commands to send:
     - =CONFIG,1 - Enable configuration mode
-    - =OUTPUTFMT,B - Set output format to B
-    - =OUTPUTRATE,200 - Set output rate to 200Hz
-    - =OUTPUTBAUD,115200 - Set baud rate to 115200 
+    - =OUTPUTFMT,C - Set output format to C (default in C++ implementation)
+    - =LINFMT,ACCEL - Set linear acceleration units to g's
+    - =ROTUNITS,RAD - Set rotation units to radians  
+    - =ROTFMT,RATE - Set rotation format to rate (rad/s)
+    - =DR,1000 - Set data rate to 1000Hz
+    - =BAUD,921600 - Set baud rate to 921600 (default for 1000Hz in C++ implementation)
     - =CONFIG,0 - Exit configuration mode
     """
     config_commands = [
-        "=CONFIG,1\r\n",
-        "=OUTPUTFMT,B\r\n", 
-        "=OUTPUTRATE,200\r\n",
-        "=OUTPUTBAUD,115200\r\n",
-        "=CONFIG,0\r\n"
+        "=CONFIG,1\n",
+        "=OUTPUTFMT,C\n",     # Format C (default in C++ implementation)
+        "=LINFMT,ACCEL\n",    # Linear acceleration in g's
+        "=ROTUNITS,RAD\n",    # Angular velocity in radians/sec
+        "=ROTFMT,RATE\n",     # Angular velocity format
+        "=DR,1000\n",         # Data rate 1000Hz
+        "=BAUD,921600\n",     # Baud rate 921600 (default for 1000Hz)
+        "=CONFIG,0\n"         # Exit configuration mode
     ]
     
     for cmd in config_commands:
@@ -153,13 +267,92 @@ def configure_kvh_device_for_binary_format_b():
         sys.stdout.flush()
         time.sleep(0.1)  # Small delay between commands
     
-    print("Configuration commands sent. Device should now output binary format B.")
+    print("Configuration commands sent. Device should now output binary format C.")
 
+
+
+def validate_magnetic_field(mag_value):
+    """
+    Validate magnetic field value following C++ implementation.
+    Valid range: -10.0 to +10.0 Gauss
+    """
+    MAG_FIELD_INVALID_MIN = -10.0
+    MAG_FIELD_INVALID_MAX = 10.0
+    
+    if mag_value < MAG_FIELD_INVALID_MIN or mag_value > MAG_FIELD_INVALID_MAX:
+        logging.warning(f"Invalid magnetic field value: {mag_value} Gauss")
+        return False
+    return True
+
+
+def validate_temperature(temp_celsius):
+    """
+    Validate temperature value following C++ implementation.
+    Valid range: -40°C to +75°C
+    """
+    TEMPERATURE_INVALID_MIN = -40.0
+    TEMPERATURE_INVALID_MAX = 75.0
+    
+    if temp_celsius < TEMPERATURE_INVALID_MIN or temp_celsius > TEMPERATURE_INVALID_MAX:
+        logging.warning(f"Temperature out of valid range: {temp_celsius}°C")
+        return False
+    return True
+
+
+def has_significant_change(decoded_data, threshold_gyro=0.01, threshold_accel=0.1, threshold_temp_mag=0.1):
+    """
+    Check if there's a significant change in IMU Format C data compared to the last reading.
+    
+    Args:
+        decoded_data: Current decoded IMU data (Format C)
+        threshold_gyro: Threshold for gyro change in rad/s
+        threshold_accel: Threshold for acceleration change in m/s²
+        threshold_temp_mag: Threshold for temp/magnetic data change
+        
+    Returns:
+        bool: True if there's a significant change, False otherwise
+    """
+    global last_gyro_data, last_accel_data, last_temp_mag_data, last_sequence_mod4
+    
+    # Always consider first packet as a change
+    if last_gyro_data is None or last_accel_data is None or last_temp_mag_data is None:
+        last_gyro_data = (decoded_data['gyro_x'], decoded_data['gyro_y'], decoded_data['gyro_z'])
+        last_accel_data = (decoded_data['accel_x_ms2'], decoded_data['accel_y_ms2'], decoded_data['accel_z_ms2'])
+        last_temp_mag_data = decoded_data['temp_magnetic_data']
+        last_sequence_mod4 = decoded_data['sequence_mod4']
+        return True
+    
+    # Check gyro changes
+    gyro_change = any(abs(current - last) > threshold_gyro 
+                     for current, last in zip([decoded_data['gyro_x'], decoded_data['gyro_y'], decoded_data['gyro_z']], 
+                                             last_gyro_data))
+    
+    # Check acceleration changes
+    accel_change = any(abs(current - last) > threshold_accel 
+                      for current, last in zip([decoded_data['accel_x_ms2'], decoded_data['accel_y_ms2'], decoded_data['accel_z_ms2']], 
+                                              last_accel_data))
+    
+    # Check temp/magnetic data change
+    temp_mag_change = abs(decoded_data['temp_magnetic_data'] - last_temp_mag_data) > threshold_temp_mag
+    
+    # Check if sequence mod 4 changed (indicates different type of data)
+    seq_mod4_change = decoded_data['sequence_mod4'] != last_sequence_mod4
+    
+    # Update stored values if there's a change
+    if gyro_change or accel_change or temp_mag_change or seq_mod4_change:
+        last_gyro_data = (decoded_data['gyro_x'], decoded_data['gyro_y'], decoded_data['gyro_z'])
+        last_accel_data = (decoded_data['accel_x_ms2'], decoded_data['accel_y_ms2'], decoded_data['accel_z_ms2'])
+        last_temp_mag_data = decoded_data['temp_magnetic_data']
+        last_sequence_mod4 = decoded_data['sequence_mod4']
+        return True
+    
+    return False
 
 
 if __name__ == "__main__":
     # Input arguments and configurations
     args = terminal_inputs()
+    
     # Setup logger
     logging.basicConfig(
         format="%(asctime)s %(levelname)s [%(lineno)d]: %(message)s", level=args.log_level
@@ -232,6 +425,7 @@ if __name__ == "__main__":
         # Added frequency tracking for IMU
         last_time_imu = time.time()
         imu_count = 0
+        change_count = 0  # Track number of changes detected
 
         logging.info("Press CTRL-C to quit...")
 
@@ -255,18 +449,18 @@ if __name__ == "__main__":
                     logging.info(f"First {len(chunk)} bytes received (showing first 100): {chunk[:100].hex() if len(chunk) > 0 else 'empty'}")
                     logging.info(f"As ASCII (first 100 chars): {chunk[:100].decode('ascii', errors='replace')}")
                 
-                # Process complete messages (40 bytes each)
-                while len(buffer) >= 40:
-                    # Look for the header pattern
-                    header_pos = buffer.find(b'\xFE\x81\xFF\x56')
+                # Process complete messages (38 bytes each for Format C)
+                while len(buffer) >= 38:
+                    # Look for the header pattern - Format C uses 0xFE81FF57
+                    header_pos = buffer.find(b'\xFE\x81\xFF\x57')
                     
                     if header_pos == -1:
                         # No header found, log some debug info periodically
                         if len(buffer) > 1000:  # Prevent buffer from growing too large
-                            logging.warning(f"No KVH header found in {len(buffer)} bytes of data. Sample: {buffer[:50].hex()}")
+                            logging.warning(f"No KVH Format C header found in {len(buffer)} bytes of data. Sample: {buffer[:50].hex()}")
                             logging.warning(f"Sample as ASCII: {buffer[:50].decode('ascii', errors='replace')}")
-                            # Keep last 39 bytes for potential partial header at end
-                            buffer = buffer[-39:] if len(buffer) > 39 else b''
+                            # Keep last 37 bytes for potential partial header at end
+                            buffer = buffer[-37:] if len(buffer) > 37 else b''
                         break
                     
                     # Remove any data before the header
@@ -274,25 +468,34 @@ if __name__ == "__main__":
                         logging.info(f"Skipped {header_pos} bytes before KVH header")
                         buffer = buffer[header_pos:]
                     
-                    # Check if we have a complete message
-                    if len(buffer) < 40:
+                    # Check if we have a complete message (38 bytes for Format C)
+                    if len(buffer) < 38:
                         break
                     
                     # Extract the message
-                    message_data = buffer[:40]
-                    buffer = buffer[40:]
+                    message_data = buffer[:38]
+                    buffer = buffer[38:]
                     message_count += 1
                     
                     # Log first few messages for debugging
                     if message_count <= 3:
-                        logging.info(f"KVH message #{message_count}: {message_data.hex()}")
+                        logging.info(f"KVH Format C message #{message_count}: {message_data.hex()}")
                     
-                    # Decode the binary message
-                    decoded = decode_kvh_binary_format_b(message_data)
+                    # Decode the binary message using Format C decoder
+                    decoded = decode_kvh_binary_format_c(message_data)
                     
                     if decoded is None:
                         logging.warning("Failed to decode binary message")
                         continue
+                    
+                    # Sequence number validation (following C++ implementation)
+                    if not first_packet:
+                        if decoded['sequence'] != expected_sequence:
+                            logging.warning(f"Sequence number mismatch. Expected: {expected_sequence}, Got: {decoded['sequence']}")
+                    
+                    # Update expected sequence for next packet
+                    expected_sequence = (decoded['sequence'] + 1) % 128
+                    first_packet = False
                     
                     # Publish the raw binary data
                     if "raw" in args.publish:
@@ -309,41 +512,70 @@ if __name__ == "__main__":
                     imu_count += 1
                     if (time.time() - last_time_imu) >= 5:
                         freq_imu = imu_count / 5.0
-                        logging.info(f"IMU frequency: {freq_imu} Hz (processed {message_count} total messages)")
+                        change_rate = change_count / 5.0 if change_count > 0 else 0
+                        logging.info(f"IMU frequency: {freq_imu:.1f} Hz (processed {message_count} total messages, "
+                                   f"{change_rate:.1f} changes/sec)")
                         imu_count = 0
+                        change_count = 0
                         last_time_imu = time.time()
 
                     if "imu" in args.publish:
-                        logging.debug(f"IMU Binary Data Decoded: gyro=({decoded['gyro_x']:.3f}, {decoded['gyro_y']:.3f}, {decoded['gyro_z']:.3f}), "
-                                    f"accel=({decoded['accel_x']:.3f}, {decoded['accel_y']:.3f}, {decoded['accel_z']:.3f}), "
-                                    f"seq={decoded['sequence']}, temp={decoded['temperature_raw']}")
+                        # Check if there's a significant change in the data
+                        has_change = has_significant_change(decoded)
+                        if has_change:
+                            change_count += 1
+                        
+                        # Enhanced logging with CRC validation status - only on change
+                        if has_change:
+                            # Determine what type of temp/mag data this is
+                            data_type_str = ""
+                            if decoded['sequence_mod4'] == 0 and decoded['temp_data'] is not None:
+                                data_type_str = f"temp={decoded['temp_data']:.1f}°C"
+                            elif decoded['sequence_mod4'] == 1 and decoded['mag_x_data'] is not None:
+                                data_type_str = f"magX={decoded['mag_x_data']:.3f}G"
+                            elif decoded['sequence_mod4'] == 2 and decoded['mag_y_data'] is not None:
+                                data_type_str = f"magY={decoded['mag_y_data']:.3f}G"  
+                            elif decoded['sequence_mod4'] == 3 and decoded['mag_z_data'] is not None:
+                                data_type_str = f"magZ={decoded['mag_z_data']:.3f}G"
+                            else:
+                                data_type_str = f"raw={decoded['temp_magnetic_data']:.3f}"
+                                
+                            logging.info(f"IMU Format C CHANGE: gyro=({decoded['gyro_x']:.3f}, {decoded['gyro_y']:.3f}, {decoded['gyro_z']:.3f})rad/s, "
+                                        f"accel=({decoded['accel_x']:.3f}g, {decoded['accel_y']:.3f}g, {decoded['accel_z']:.3f}g) -> "
+                                        f"({decoded['accel_x_ms2']:.3f}, {decoded['accel_y_ms2']:.3f}, {decoded['accel_z_ms2']:.3f})m/s², "
+                                        f"seq={decoded['sequence']}, {data_type_str}, "
+                                        f"CRC={'OK' if decoded['crc_valid'] else 'FAIL'}")
+                        else:
+                            # Still log at debug level for troubleshooting
+                            logging.debug(f"IMU Data (no change): seq={decoded['sequence']}, "
+                                         f"CRC={'OK' if decoded['crc_valid'] else 'FAIL'}")
 
-                        # Only publish if data is valid
-                        if decoded['accel_x_valid'] and decoded['accel_y_valid'] and decoded['accel_z_valid']:
-                            # Acceleration 
+                        # Only publish if data is valid and CRC is correct
+                        if decoded['accel_x_valid'] and decoded['accel_y_valid'] and decoded['accel_z_valid'] and decoded['crc_valid']:
+                            # Acceleration - using converted m/s² values
                             payload_imu_acc = Decomposed3DVector()
                             payload_imu_acc.timestamp.FromNanoseconds(int(datetime.now().timestamp() * 1e9))
                             
                             if args.frame_id is not None:
                                 payload_imu_acc.frame_id = args.frame_id
                                 
-                            # Binary format already provides m/s² values
-                            payload_imu_acc.vector.x = decoded['accel_x']
-                            payload_imu_acc.vector.y = decoded['accel_y']
-                            payload_imu_acc.vector.z = decoded['accel_z']
+                            # Use converted m/s² values (following C++ implementation)
+                            payload_imu_acc.vector.x = decoded['accel_x_ms2']
+                            payload_imu_acc.vector.y = decoded['accel_y_ms2']
+                            payload_imu_acc.vector.z = decoded['accel_z_ms2']
 
                             serialized_payload = payload_imu_acc.SerializeToString()
                             envelope = keelson.enclose(serialized_payload)
                             pub_imu_acc.put(envelope)
 
-                        if decoded['gyro_x_valid'] and decoded['gyro_y_valid'] and decoded['gyro_z_valid']:
+                        if decoded['gyro_x_valid'] and decoded['gyro_y_valid'] and decoded['gyro_z_valid'] and decoded['crc_valid']:
                             # Angular velocity
                             payload_imu_vel = Decomposed3DVector()
                             payload_imu_vel.timestamp.FromNanoseconds(int(datetime.now().timestamp() * 1e9))
                             if args.frame_id is not None:
                                 payload_imu_vel.frame_id = args.frame_id
                                 
-                            # Binary format already provides rad/s values
+                            # Binary format provides rad/s values directly
                             payload_imu_vel.vector.x = decoded['gyro_x']
                             payload_imu_vel.vector.y = decoded['gyro_y']
                             payload_imu_vel.vector.z = decoded['gyro_z']
@@ -352,7 +584,8 @@ if __name__ == "__main__":
                             envelope = keelson.enclose(serialized_payload)
                             pub_imu_vel.put(envelope)
 
-                        logging.debug(f"IMU Binary Data SENT")
+                        if has_change:
+                            logging.debug(f"IMU Binary Data SENT")
                         
                 # Log progress periodically
                 if data_received_count % 10000 == 0:
@@ -362,7 +595,7 @@ if __name__ == "__main__":
             logging.info("Keyboard interrupt received, exiting...")
         except Exception as e:
             logging.error(f"An error occurred while processing binary data: {e}")
-                
+
 
 
 

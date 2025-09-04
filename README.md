@@ -1,20 +1,26 @@
 # Keelson Connector KVH
 
-Tools for connecting KVH IMU units to the Keelson ecosystem. This connector supports KVH IMU binary output format B.
+Tools for connecting KVH IMU units to the Keelson ecosystem. This connector supports KVH IMU binary output format C (default as per OpenDLV implementation).
 
-## KVH IMU Binary Format B
+## KVH IMU Binary Format C
 
-The connector processes 40-byte binary messages with the following structure:
+The connector processes 38-byte binary messages with the following structure:
 
-- **Header** (bytes 1-4): Always `0xFE81FF56`
-- **Message Data** (bytes 5-36):
+- **Header** (bytes 1-4): Always `0xFE81FF57`
+- **Message Data** (bytes 5-34):
   - X,Y,Z rotational data (rad/s) - SPFP format
-  - X,Y,Z acceleration data (m/s²) - SPFP format
-  - Timestamp (microseconds) - UINT32
+  - X,Y,Z acceleration data (g's, converted to m/s²) - SPFP format
+  - Interleaved Temperature/Magnetic data - SPFP format
   - Status byte (sensor validity flags)
   - Sequence number (0-127) - UINT8
-  - Temperature - INT16
-- **CRC** (bytes 37-40): Cyclic redundancy check
+- **CRC** (bytes 35-38): CRC-32/MPEG-2 checksum (split as 2x UINT16)
+
+### Interleaved Temperature/Magnetic Data
+Based on sequence number modulo 4:
+- **sequence % 4 == 0**: Temperature (°C)
+- **sequence % 4 == 1**: Magnetic field X (Gauss)
+- **sequence % 4 == 2**: Magnetic field Y (Gauss)  
+- **sequence % 4 == 3**: Magnetic field Z (Gauss)
 
 ## Quick Start
 
@@ -22,6 +28,16 @@ The connector processes 40-byte binary messages with the following structure:
 # Serial connection via socat
 
 socat -d -d -v OPEN:/dev/cu.usbserial-FT0R4P590,rdonly,nonblock=1,ignoreeof STDOUT | bin/main --log-level 10 -r rise -e storakrabban --publish raw --publish imu --publish pos
+
+socat /dev/ttyUSB0,b115200,raw,echo=0 - | 
+
+
+
+
+socat /dev/ttyUSB4,b921600,raw,echo=0 - | bin/main --log-level 10 -r rise -e storakrabban --publish raw --publish imu --publish pos
+
+docker run -ti --init --rm --net=host --device=/dev/ttyUSB4 registry.opendlv.org/community/opendlv-device-imu-kvhp1775:local --cid=111 --debug --port=/dev/ttyUSB4 --messageType=C
+
 
 socat /dev/ttyUSB0,b115200,raw,echo=0 - | bin/main --log-level 10 -r rise -e kvh_imu --publish raw --publish imu
 
